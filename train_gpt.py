@@ -93,6 +93,11 @@ class Hyperparameters:
     ttt_eval_seq_len = int(os.environ.get("TTT_EVAL_SEQ_LEN", 1024))
     ttt_batch_size = int(os.environ.get("TTT_BATCH_SIZE", 64))
 
+    # Block Attention Residuals (https://arxiv.org/pdf/2603.15031, variant a).
+    # Each sub-layer type attends only over its own prior outputs (attn→attn, MLP→MLP),
+    # halving history depth vs. Full AttnRes and avoiding cross-type noise.
+    block_attn_res: bool = bool(int(os.environ.get("BLOCK_ATTN_RES", "1")))
+
 # -----------------------------
 # MUON OPTIMIZER 
 # -----------------------------
@@ -296,7 +301,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain",
     ).split(",")
     if pattern
 )
@@ -513,6 +518,22 @@ class RMSNorm(nn.Module):
         return F.rms_norm(x, (x.size(-1),), eps=self.eps)
 
 
+def _block_attn_res_op(history: list[Tensor], current: Tensor, w: Tensor) -> Tensor:
+    # Block AttnRes op (paper §3.2, variant a): each sub-layer type attends only over
+    # its own prior outputs (attn history for attn, MLP history for MLP) plus current x.
+    #
+    #   V = stack([h_0, ..., h_{N-1}, current])   # (N+1, B, T, D)
+    #   K = RMSNorm(V)                             # normalize each entry
+    #   logits[n,b,t] = w · K[n,b,t]              # scalar dot product
+    #   out[b,t] = softmax(logits[:,b,t]) · V      # weighted sum
+    #
+    # Zero-init w → uniform attention at start (neutral, like a simple average).
+    V = torch.stack(history + [current], dim=0)          # (N+1, B, T, D)
+    K = F.rms_norm(V, (V.size(-1),))                     # normalize across D
+    logits = torch.einsum("d,nbtd->nbt", w, K)           # scalar per (entry, batch, pos)
+    return torch.einsum("nbt,nbtd->btd", logits.softmax(dim=0), V)
+
+
 class CastedLinear(nn.Linear):
     # Keep weights in fp32 for optimizer/state quality, cast at matmul time for bf16 compute.
     def forward(self, x: Tensor) -> Tensor:
@@ -636,6 +657,7 @@ class Block(nn.Module):
         mlp_mult: int,
         rope_base: float,
         qk_gain_init: float,
+        block_attn_res: bool = True,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
@@ -645,16 +667,33 @@ class Block(nn.Module):
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
+        self.block_attn_res = block_attn_res
+        if block_attn_res:
+            # One learned (D,) weight vector per block. Zero-init → uniform attention
+            # over all previous block outputs at the start of training.
+            self.block_attn_res_w = nn.Parameter(torch.zeros(dim, dtype=torch.float32))
 
-    def forward(self, x: Tensor, x0: Tensor, q_delta_fn=None, v_delta_fn=None) -> Tensor:
-        mix = self.resid_mix.to(dtype=x.dtype)
-        x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
-        n = self.attn_norm(x)
+    def forward(self, x: Tensor, x0: Tensor, history: list[Tensor], q_delta_fn=None, v_delta_fn=None) -> Tensor:
+        if self.block_attn_res:
+            # Block AttnRes (variant a): blend all previous block outputs once at block
+            # entry to produce the attn input. MLP uses the standard post-attn residual.
+            h = _block_attn_res_op(history, x, self.block_attn_res_w.to(x.dtype))
+        else:
+            mix = self.resid_mix.to(dtype=x.dtype)
+            h = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
+
+        n = self.attn_norm(h)
         qd = q_delta_fn(n) if q_delta_fn is not None else None
         vd = v_delta_fn(n) if v_delta_fn is not None else None
         attn_out = self.attn(n, qd, vd)
         x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
-        x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
+
+        mlp_out = self.mlp(self.mlp_norm(x))
+        x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * mlp_out
+
+        if self.block_attn_res:
+            history.append(x)  # record this block's output for future blocks
+
         return x
 
 
@@ -672,6 +711,7 @@ class GPT(nn.Module):
         logit_softcap: float,
         rope_base: float,
         qk_gain_init: float,
+        block_attn_res: bool = True,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -679,11 +719,8 @@ class GPT(nn.Module):
         self.tie_embeddings = tie_embeddings
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
+        self.block_attn_res = block_attn_res
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
-        self.num_encoder_layers = num_layers // 2
-        self.num_decoder_layers = num_layers - self.num_encoder_layers
-        self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
-        self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
         self.blocks = nn.ModuleList(
             [
                 Block(
@@ -693,6 +730,7 @@ class GPT(nn.Module):
                     mlp_mult,
                     rope_base,
                     qk_gain_init,
+                    block_attn_res=block_attn_res,
                 )
                 for i in range(num_layers)
             ]
@@ -714,21 +752,14 @@ class GPT(nn.Module):
         x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
-        skips: list[Tensor] = []
+        # history[0] = x0; each block appends its output so subsequent blocks can
+        # attend over all prior block outputs via the block AttnRes blend.
+        history: list[Tensor] = [x0] if self.block_attn_res else []
 
-        # First half stores skips; second half reuses them in reverse order.
-        for i in range(self.num_encoder_layers):
+        for i, block in enumerate(self.blocks):
             qd = lora.q_loras[i] if lora else None
             vd = lora.v_loras[i] if lora else None
-            x = self.blocks[i](x, x0, qd, vd)
-            skips.append(x)
-        for i in range(self.num_decoder_layers):
-            bi = self.num_encoder_layers + i
-            if skips:
-                x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            qd = lora.q_loras[bi] if lora else None
-            vd = lora.v_loras[bi] if lora else None
-            x = self.blocks[bi](x, x0, qd, vd)
+            x = block(x, x0, history, qd, vd)
         x = self.final_norm(x)
         if self.tie_embeddings:
             logits = F.linear(x, self.tok_emb.weight)
@@ -1065,6 +1096,7 @@ def main() -> None:
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
+        block_attn_res=args.block_attn_res,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -1091,8 +1123,6 @@ def main() -> None:
         for name, p in block_named_params
         if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
-    if base_model.skip_weights.numel() > 0:
-        scalar_params.append(base_model.skip_weights)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
@@ -1125,7 +1155,7 @@ def main() -> None:
         optimizers.insert(1, optimizer_head)
 
     n_params = sum(p.numel() for p in base_model.parameters())
-    log0(f"model_params:{n_params}")
+    log0(f"model_params:{n_params} block_attn_res:{args.block_attn_res}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
