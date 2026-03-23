@@ -27,6 +27,13 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 
+try:
+    import triton
+    import triton.language as tl
+    _TRITON_AVAILABLE = True
+except ImportError:
+    _TRITON_AVAILABLE = False
+
 # -----------------------------
 # HYPERPARAMETERS
 # -----------------------------
@@ -93,10 +100,10 @@ class Hyperparameters:
     ttt_eval_seq_len = int(os.environ.get("TTT_EVAL_SEQ_LEN", 1024))
     ttt_batch_size = int(os.environ.get("TTT_BATCH_SIZE", 64))
 
-    # Block Attention Residuals (https://arxiv.org/pdf/2603.15031, variant a).
-    # Each sub-layer type attends only over its own prior outputs (attn→attn, MLP→MLP),
-    # halving history depth vs. Full AttnRes and avoiding cross-type noise.
-    block_attn_res: bool = bool(int(os.environ.get("BLOCK_ATTN_RES", "1")))
+    # Attention Residuals (https://arxiv.org/pdf/2603.15031).
+    # Default (BLOCK_ATTN_RES=0): Full AttnRes (variant b) — blend at both attn and MLP entries.
+    # BLOCK_ATTN_RES=1: Block AttnRes (variant a) — blend once at block entry only.
+    block_attn_res: bool = bool(int(os.environ.get("BLOCK_ATTN_RES", "0")))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -518,20 +525,102 @@ class RMSNorm(nn.Module):
         return F.rms_norm(x, (x.size(-1),), eps=self.eps)
 
 
+if _TRITON_AVAILABLE:
+    @triton.jit
+    def _attn_res_fwd_kernel(
+        V_ptr, w_ptr, out_ptr,
+        N, BT,
+        stride_n,           # stride between history entries: B*T*D
+        D: tl.constexpr,    # model dim, must be power-of-2
+    ):
+        # Each program handles one (batch, time) position.
+        bt = tl.program_id(0)
+        offs = tl.arange(0, D)
+        w = tl.load(w_ptr + offs).to(tl.float32)
+
+        # Online softmax: single pass over N history entries.
+        m = float("-inf")   # running max logit
+        denom = 0.0         # running sum of exp(logit - m)
+        acc = tl.zeros([D], dtype=tl.float32)
+
+        for n in range(N):
+            v = tl.load(V_ptr + n * stride_n + bt * D + offs).to(tl.float32)
+            rms_inv = tl.rsqrt(tl.sum(v * v, axis=0) / D + 1e-6)
+            logit = tl.sum(w * v * rms_inv, axis=0)
+            m_new = tl.maximum(m, logit)
+            scale = tl.exp(m - m_new)
+            exp_l = tl.exp(logit - m_new)
+            denom = denom * scale + exp_l
+            acc = acc * scale + exp_l * v
+            m = m_new
+
+        tl.store(out_ptr + bt * D + offs, (acc / denom).to(tl.bfloat16))
+
+
+    class _AttnResFunction(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, V: Tensor, w: Tensor) -> Tensor:
+            # V: (N, BT, D) contiguous; w: (D,) fp32
+            N, BT, D = V.shape
+            out = torch.empty(BT, D, dtype=torch.bfloat16, device=V.device)
+            _attn_res_fwd_kernel[(BT,)](
+                V, w, out,
+                N, BT,
+                stride_n=BT * D,
+                D=D,
+            )
+            ctx.save_for_backward(V, w, out)
+            return out
+
+        @staticmethod
+        def backward(ctx, grad_out: Tensor):
+            V, w, out = ctx.saved_tensors
+            V_f = V.float()
+            w_f = w.float()
+            # Recompute softmax weights from the saved output.
+            K = F.rms_norm(V_f, (V_f.size(-1),))             # (N, BT, D)
+            logits = torch.einsum("d,nbd->nb", w_f, K)       # (N, BT)  — b indexes BT here
+            weights = logits.softmax(dim=0)                   # (N, BT)
+            # Gradient w.r.t. V (weighted sum path + softmax path).
+            g = grad_out.float()                              # (BT, D)
+            # d(out)/d(V[n]) = weights[n] * I  (direct weighted-sum term)
+            grad_V_direct = weights.unsqueeze(-1) * g.unsqueeze(0)  # (N, BT, D)
+            # Softmax Jacobian: d(weights)/d(logits[n]) = w_n*(delta_mn - w_m)
+            # d(out)/d(logits[n]) = (e_n - weights) term via softmax Jacobian * g·V
+            g_dot_V = (g.unsqueeze(0) * V_f).sum(-1)                # (N, BT) dot with each history
+            # sum_m weights[m]*g·V[m]
+            exp_gV = (weights * g_dot_V).sum(0, keepdim=True)       # (1, BT)
+            d_logits = weights * (g_dot_V - exp_gV)                 # (N, BT)
+            # d(logits[n])/d(w) = K[n]; d(logits[n])/d(V[n]) = w * rms_inv (approx, ignoring rms grad)
+            grad_w = (d_logits.unsqueeze(-1) * K).sum((0, 1))       # (D,)
+            # gradient through rms_norm on V (simplified: treat rms_inv as constant)
+            rms_inv = (V_f.pow(2).mean(-1, keepdim=True) + 1e-6).rsqrt()
+            grad_V_logit = d_logits.unsqueeze(-1) * w_f.unsqueeze(0).unsqueeze(0) * rms_inv
+            grad_V = grad_V_direct + grad_V_logit
+            return grad_V.to(V.dtype), grad_w.to(w.dtype)
+
+
 def _block_attn_res_op(history: list[Tensor], current: Tensor, w: Tensor) -> Tensor:
-    # Block AttnRes op (paper §3.2, variant a): each sub-layer type attends only over
-    # its own prior outputs (attn history for attn, MLP history for MLP) plus current x.
-    #
-    #   V = stack([h_0, ..., h_{N-1}, current])   # (N+1, B, T, D)
+    #   V = stack([h_0, ..., h_{N-1}, current])   # (N, B, T, D)
     #   K = RMSNorm(V)                             # normalize each entry
     #   logits[n,b,t] = w · K[n,b,t]              # scalar dot product
-    #   out[b,t] = softmax(logits[:,b,t]) · V      # weighted sum
+    #   out[b,t] = softmax(logits[:,b,t]) · V      # softmax-weighted sum
     #
-    # Zero-init w → uniform attention at start (neutral, like a simple average).
-    V = torch.stack(history + [current], dim=0)          # (N+1, B, T, D)
-    K = F.rms_norm(V, (V.size(-1),))                     # normalize across D
-    logits = torch.einsum("d,nbtd->nbt", w, K)           # scalar per (entry, batch, pos)
-    return torch.einsum("nbt,nbtd->btd", logits.softmax(dim=0), V)
+    # Online-softmax Triton kernel fuses rms_norm + logit + softmax + weighted-sum
+    # in a single pass over V; falls back to explicit ops when Triton unavailable.
+    V = torch.stack(history + [current], dim=0)   # (N, B, T, D)
+    N, B, T, D = V.shape
+    w_f = w.float()
+    if _TRITON_AVAILABLE and (D & (D - 1)) == 0:
+        # Triton path: reshape to (N, BT, D) for the kernel.
+        V_bt = V.view(N, B * T, D).contiguous()
+        out_bt = _AttnResFunction.apply(V_bt, w_f)
+        return out_bt.view(B, T, D)
+    else:
+        # Fallback: explicit ops (no Triton or D not power-of-2).
+        K = F.rms_norm(V, (D,))
+        logits = torch.einsum("d,nbtd->nbt", w_f, K)
+        return torch.einsum("nbt,nbtd->btd", logits.softmax(dim=0), V)
 
 
 class CastedLinear(nn.Linear):
@@ -657,7 +746,7 @@ class Block(nn.Module):
         mlp_mult: int,
         rope_base: float,
         qk_gain_init: float,
-        block_attn_res: bool = True,
+        block_attn_res: bool = False,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
@@ -666,34 +755,37 @@ class Block(nn.Module):
         self.mlp = MLP(dim, mlp_mult)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
-        self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
         self.block_attn_res = block_attn_res
         if block_attn_res:
-            # One learned (D,) weight vector per block. Zero-init → uniform attention
-            # over all previous block outputs at the start of training.
+            # Block AttnRes (variant a): one blend at block entry.
             self.block_attn_res_w = nn.Parameter(torch.zeros(dim, dtype=torch.float32))
-
-    def forward(self, x: Tensor, x0: Tensor, history: list[Tensor], q_delta_fn=None, v_delta_fn=None) -> Tensor:
-        if self.block_attn_res:
-            # Block AttnRes (variant a): blend all previous block outputs once at block
-            # entry to produce the attn input. MLP uses the standard post-attn residual.
-            h = _block_attn_res_op(history, x, self.block_attn_res_w.to(x.dtype))
         else:
-            mix = self.resid_mix.to(dtype=x.dtype)
-            h = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
+            # Full AttnRes (variant b, default): one blend per sub-layer.
+            self.attn_res_w_attn = nn.Parameter(torch.zeros(dim, dtype=torch.float32))
+            self.attn_res_w_mlp  = nn.Parameter(torch.zeros(dim, dtype=torch.float32))
 
-        n = self.attn_norm(h)
+    def forward(self, x: Tensor, history: list[Tensor], q_delta_fn=None, v_delta_fn=None) -> Tensor:
+        if self.block_attn_res:
+            # Block AttnRes (variant a): blend once at entry; MLP uses standard residual.
+            h_attn = _block_attn_res_op(history, x, self.block_attn_res_w.to(x.dtype))
+        else:
+            # Full AttnRes (variant b): blend at attn entry.
+            h_attn = _block_attn_res_op(history, x, self.attn_res_w_attn.to(x.dtype))
+
+        n = self.attn_norm(h_attn)
         qd = q_delta_fn(n) if q_delta_fn is not None else None
         vd = v_delta_fn(n) if v_delta_fn is not None else None
         attn_out = self.attn(n, qd, vd)
         x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
 
+        if not self.block_attn_res:
+            # Full AttnRes (variant b): also blend before MLP.
+            x = _block_attn_res_op(history, x, self.attn_res_w_mlp.to(x.dtype))
+
         mlp_out = self.mlp(self.mlp_norm(x))
         x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * mlp_out
 
-        if self.block_attn_res:
-            history.append(x)  # record this block's output for future blocks
-
+        history.append(x)
         return x
 
 
@@ -711,7 +803,7 @@ class GPT(nn.Module):
         logit_softcap: float,
         rope_base: float,
         qk_gain_init: float,
-        block_attn_res: bool = True,
+        block_attn_res: bool = False,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -752,14 +844,13 @@ class GPT(nn.Module):
         x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
-        # history[0] = x0; each block appends its output so subsequent blocks can
-        # attend over all prior block outputs via the block AttnRes blend.
-        history: list[Tensor] = [x0] if self.block_attn_res else []
+        # history[0] = x0; each block appends its output for subsequent AttnRes blends.
+        history: list[Tensor] = [x0]
 
         for i, block in enumerate(self.blocks):
             qd = lora.q_loras[i] if lora else None
             vd = lora.v_loras[i] if lora else None
-            x = block(x, x0, history, qd, vd)
+            x = block(x, history, qd, vd)
         x = self.final_norm(x)
         if self.tie_embeddings:
             logits = F.linear(x, self.tok_emb.weight)

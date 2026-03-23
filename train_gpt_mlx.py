@@ -80,7 +80,9 @@ class Hyperparameters:
     logit_softcap: float = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
     rope_base: float = float(os.environ.get("ROPE_BASE", 10000.0))
     qk_gain_init: float = float(os.environ.get("QK_GAIN_INIT", 1.5))
-    block_attn_res: bool = bool(int(os.environ.get("BLOCK_ATTN_RES", "1")))
+    # Default (BLOCK_ATTN_RES=0): Full AttnRes (variant b) — blend at both attn and MLP entries.
+    # BLOCK_ATTN_RES=1: Block AttnRes (variant a) — blend once at block entry only.
+    block_attn_res: bool = bool(int(os.environ.get("BLOCK_ATTN_RES", "0")))
 
     # Optimizer. We keep the same per-group defaults as train_gpt.py.
     beta1: float = float(os.environ.get("BETA1", 0.9))
@@ -368,7 +370,7 @@ class Block(nn.Module):
         mlp_mult: int,
         rope_base: float,
         qk_gain_init: float,
-        block_attn_res: bool = True,
+        block_attn_res: bool = False,
     ):
         super().__init__()
         self.block_attn_res = block_attn_res
@@ -378,29 +380,35 @@ class Block(nn.Module):
         self.mlp = MLP(dim, mlp_mult)
         self.attn_scale = mx.ones((dim,), dtype=mx.float32)
         self.mlp_scale = mx.ones((dim,), dtype=mx.float32)
-        self.resid_mix = mx.array(np.stack((np.ones((dim,), dtype=np.float32), np.zeros((dim,), dtype=np.float32))))
         if block_attn_res:
+            # Block AttnRes (variant a): one blend at block entry.
             self.block_attn_res_w = mx.zeros((dim,), dtype=mx.float32)
-
-    def __call__(self, x: mx.array, x0: mx.array, history: list[mx.array] | None = None) -> mx.array:
-        if self.block_attn_res and history is not None:
-            # Block AttnRes: blend all previous block outputs once at block entry.
-            h = _block_attn_res_op(history, x, self.block_attn_res_w.astype(x.dtype))
         else:
-            mix = self.resid_mix.astype(x.dtype)
-            h = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
-        attn_out = self.attn(self.attn_norm(h))
+            # Full AttnRes (variant b, default): one blend per sub-layer.
+            self.attn_res_w_attn = mx.zeros((dim,), dtype=mx.float32)
+            self.attn_res_w_mlp  = mx.zeros((dim,), dtype=mx.float32)
+
+    def __call__(self, x: mx.array, history: list[mx.array]) -> mx.array:
+        if self.block_attn_res:
+            # Block AttnRes (variant a): blend once at entry; MLP uses standard residual.
+            h_attn = _block_attn_res_op(history, x, self.block_attn_res_w.astype(x.dtype))
+        else:
+            # Full AttnRes (variant b): blend at attn entry.
+            h_attn = _block_attn_res_op(history, x, self.attn_res_w_attn.astype(x.dtype))
+        attn_out = self.attn(self.attn_norm(h_attn))
         x = x + self.attn_scale.astype(x.dtype)[None, None, :] * attn_out
+        if not self.block_attn_res:
+            # Full AttnRes (variant b): also blend before MLP.
+            x = _block_attn_res_op(history, x, self.attn_res_w_mlp.astype(x.dtype))
         x = x + self.mlp_scale.astype(x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
-        if self.block_attn_res and history is not None:
-            history.append(x)  # record this block's output for future blocks
+        history.append(x)
         return x
 
 
 class GPT(nn.Module):
     def __init__(self, vocab_size: int, num_layers: int, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: int,
                  logit_chunk_tokens: int, logit_softcap: float, rope_base: float, tied_embed_init_std: float,
-                 qk_gain_init: float, block_attn_res: bool = True):
+                 qk_gain_init: float, block_attn_res: bool = False):
         super().__init__()
         if logit_softcap <= 0.0:
             raise ValueError(f"logit_softcap must be positive, got {logit_softcap}")
@@ -428,11 +436,10 @@ class GPT(nn.Module):
 
     def __call__(self, input_ids: mx.array) -> mx.array:
         x = rms_norm(self.tok_emb(input_ids).astype(COMPUTE_DTYPE))
-        x0 = x
-        history: list[mx.array] = [x0] if self.block_attn_res else []
+        history: list[mx.array] = [x]
 
         for block in self.blocks:
-            x = block(x, x0, history)
+            x = block(x, history)
         return self.final_norm(x)
 
     def loss(self, input_ids: mx.array, target_ids: mx.array) -> mx.array:
