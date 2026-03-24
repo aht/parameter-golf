@@ -90,7 +90,11 @@ class Hyperparameters:
     ve_layers = os.environ.get("VE_LAYERS", "9,10")
     # Full AttnRes (default): attend over all history before both attn and MLP.
     # Block AttnRes (BLOCK_ATTN_RES=1): attend over history once at block entry only.
+    # Mutually exclusive with DENSEFORMER.
     block_attn_res: bool = bool(int(os.environ.get("BLOCK_ATTN_RES", "0")))
+    # DenseFormer (arXiv 2402.02622): per-layer scalar DWA mixing of all history after each block.
+    # Mutually exclusive with BLOCK_ATTN_RES / AttnRes.
+    denseformer: bool = bool(int(os.environ.get("DENSEFORMER", "0")))
 def zeropower_via_newtonschulz5(G: Tensor, steps: int = 10, eps: float = 1e-7) -> Tensor:
     a, b, c = (3.4445, -4.7750, 2.0315)
     X = G.bfloat16()
@@ -628,6 +632,7 @@ class Block(nn.Module):
         ln_scale: bool = False,
         dtg: bool = False,
         block_attn_res: bool = False,
+        use_attn_res: bool = True,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
@@ -637,30 +642,36 @@ class Block(nn.Module):
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.ln_scale_factor = 1.0 / math.sqrt(layer_idx + 1) if ln_scale else 1.0
+        self.use_attn_res = use_attn_res
         self.block_attn_res = block_attn_res
-        if block_attn_res:
-            # Block variant: one AttnRes op at block entry; MLP uses plain residual.
-            self.attn_res_w = nn.Parameter(torch.zeros(dim, dtype=torch.float32))
-        else:
-            # Full variant (default): AttnRes before attention AND before MLP.
-            self.attn_res_w_attn = nn.Parameter(torch.zeros(dim, dtype=torch.float32))
-            self.attn_res_w_mlp  = nn.Parameter(torch.zeros(dim, dtype=torch.float32))
+        if use_attn_res:
+            if block_attn_res:
+                # Block variant: one AttnRes op at block entry; MLP uses plain residual.
+                self.attn_res_w = nn.Parameter(torch.zeros(dim, dtype=torch.float32))
+            else:
+                # Full variant (default): AttnRes before attention AND before MLP.
+                self.attn_res_w_attn = nn.Parameter(torch.zeros(dim, dtype=torch.float32))
+                self.attn_res_w_mlp  = nn.Parameter(torch.zeros(dim, dtype=torch.float32))
         if dtg:
             self.dtg_gate = nn.Linear(dim, 1, bias=True)
             nn.init.zeros_(self.dtg_gate.weight)
             nn.init.constant_(self.dtg_gate.bias, 2.0)
         else:
             self.dtg_gate = None
-    def forward(self, x: Tensor, history: Tensor, v_embed: Tensor | None = None) -> Tensor:
+    def forward(self, x: Tensor, history: Tensor | None = None, v_embed: Tensor | None = None) -> Tensor:
         # history: (N, B, T, D) — x0 at [0], prior block outputs after; managed by GPT.forward.
+        # When history is None (e.g. DenseFormer mode), block runs as a standard residual block.
         # w=0 init → uniform attention over history (neutral average) at start.
-        if self.block_attn_res:
-            x_in = _attn_res_op(history, x, self.attn_res_w)
+        if self.use_attn_res and history is not None:
+            if self.block_attn_res:
+                x_in = _attn_res_op(history, x, self.attn_res_w)
+            else:
+                x_in = _attn_res_op(history, x, self.attn_res_w_attn)
         else:
-            x_in = _attn_res_op(history, x, self.attn_res_w_attn)
+            x_in = x
         attn_out = self.attn(self.attn_norm(x_in) * self.ln_scale_factor, v_embed=v_embed)
         x_out = x_in + self.attn_scale.to(dtype=x_in.dtype)[None, None, :] * attn_out
-        if not self.block_attn_res:
+        if self.use_attn_res and history is not None and not self.block_attn_res:
             x_out = _attn_res_op(history, x_out, self.attn_res_w_mlp)
         x_out = x_out + self.mlp_scale.to(dtype=x_out.dtype)[None, None, :] * self.mlp(self.mlp_norm(x_out) * self.ln_scale_factor)
         if self.dtg_gate is not None:
@@ -693,6 +704,7 @@ class GPT(nn.Module):
         ve_dim: int = 128,
         ve_layers: str = "9,10",
         block_attn_res: bool = False,
+        denseformer: bool = False,
     ):
         super().__init__()
         self._ve_target_dim = num_kv_heads * (model_dim // num_heads)  # kv_dim for value projection
@@ -710,6 +722,7 @@ class GPT(nn.Module):
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
+        self.denseformer = denseformer
         self.blocks = nn.ModuleList(
             [
                 Block(
@@ -723,10 +736,23 @@ class GPT(nn.Module):
                     ln_scale=ln_scale,
                     dtg=dtg,
                     block_attn_res=block_attn_res,
+                    use_attn_res=not denseformer,
                 )
                 for i in range(num_layers)
             ]
         )
+        # DenseFormer: per-block learned scalar weights over all previous representations.
+        # dwa_alphas[i] has i+2 scalars: [x0, h_1, ..., h_i, current_block_output].
+        # Init: last=1, rest=0 → identity (start by passing through current block output unchanged).
+        if denseformer:
+            self.dwa_alphas = nn.ParameterList([
+                nn.Parameter(
+                    torch.cat([torch.zeros(i + 1), torch.ones(1)]).float()
+                )
+                for i in range(num_layers)
+            ])
+        else:
+            self.dwa_alphas = nn.ParameterList()
         if rope_dims > 0:
             head_dim = model_dim // num_heads
             for block in self.blocks:
@@ -778,6 +804,11 @@ class GPT(nn.Module):
         ve_base = ve_cache['ve'] if ve_cache is not None else self.ve_shared(input_ids)
         ve_idx = self.ve_layer_indices.index(layer_idx)
         return ve_base * self.ve_layer_scales[ve_idx].to(dtype=ve_base.dtype)
+    def _dwa(self, x: Tensor, history: list[Tensor], block_idx: int) -> Tensor:
+        """DenseFormer depth-weighted average: mix block output x with all prior history."""
+        all_reps = torch.stack(history + [x], dim=0)  # (i+2, B, T, D)
+        alphas = self.dwa_alphas[block_idx].to(dtype=x.dtype)  # (i+2,)
+        return torch.einsum("k,kbtd->btd", alphas, all_reps)
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
         if self.bigram is not None:
@@ -785,14 +816,18 @@ class GPT(nn.Module):
         x = F.rms_norm(x, (x.size(-1),))
         x = self.smear(x)
         x0 = x
-        # AttnRes history: x0 at index 0, then each block appends its output.
-        # Managed here (not inside Block) so torch.compile sees fixed-shape tensors per block.
+        # History list: x0 at index 0, then each block appends its output.
+        # Managed here so torch.compile sees fixed-shape tensors per block (loop unrolled at trace).
         history: list[Tensor] = [x0]
         skips: list[Tensor] = []
         ve_cache: dict = {}
         for i in range(self.num_encoder_layers):
             ve = self._get_ve(i, input_ids, ve_cache)
-            x = self.blocks[i](x, torch.stack(history, dim=0), v_embed=ve)
+            if self.denseformer:
+                x = self.blocks[i](x, v_embed=ve)
+                x = self._dwa(x, history, i)
+            else:
+                x = self.blocks[i](x, torch.stack(history, dim=0), v_embed=ve)
             history.append(x)
             skips.append(x)
         for i in range(self.num_decoder_layers):
@@ -800,7 +835,11 @@ class GPT(nn.Module):
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
             ve = self._get_ve(bi, input_ids, ve_cache)
-            x = self.blocks[bi](x, torch.stack(history, dim=0), v_embed=ve)
+            if self.denseformer:
+                x = self.blocks[bi](x, v_embed=ve)
+                x = self._dwa(x, history, bi)
+            else:
+                x = self.blocks[bi](x, torch.stack(history, dim=0), v_embed=ve)
             history.append(x)
         x = self.final_norm(x)
         x_flat = x.reshape(-1, x.size(-1))
@@ -843,7 +882,11 @@ class GPT(nn.Module):
         ve_cache: dict = {}
         for i in range(self.num_encoder_layers):
             ve = self._get_ve(i, input_ids, ve_cache)
-            x = self.blocks[i](x, torch.stack(history, dim=0), v_embed=ve)
+            if self.denseformer:
+                x = self.blocks[i](x, v_embed=ve)
+                x = self._dwa(x, history, i)
+            else:
+                x = self.blocks[i](x, torch.stack(history, dim=0), v_embed=ve)
             history.append(x)
             skips.append(x)
         for i in range(self.num_decoder_layers):
@@ -851,7 +894,11 @@ class GPT(nn.Module):
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
             ve = self._get_ve(bi, input_ids, ve_cache)
-            x = self.blocks[bi](x, torch.stack(history, dim=0), v_embed=ve)
+            if self.denseformer:
+                x = self.blocks[bi](x, v_embed=ve)
+                x = self._dwa(x, history, bi)
+            else:
+                x = self.blocks[bi](x, torch.stack(history, dim=0), v_embed=ve)
             history.append(x)
         x = self.final_norm(x)
         if self.tie_embeddings:
@@ -1105,6 +1152,7 @@ def main() -> None:
         ve_dim=args.ve_dim,
         ve_layers=args.ve_layers,
         block_attn_res=args.block_attn_res,
+        denseformer=args.denseformer,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -1143,6 +1191,8 @@ def main() -> None:
         scalar_params.append(base_model.ve_shared.scale)
         for s in base_model.ve_layer_scales:
             scalar_params.append(s)
+    for alpha in base_model.dwa_alphas:
+        scalar_params.append(alpha)
     optimizer_tok = torch.optim.AdamW(
         tok_params,
         betas=(args.beta1, args.beta2),
@@ -1184,7 +1234,7 @@ def main() -> None:
     log0(f"XSA:last_{args.xsa_last_n} active_layers:{xsa_layers}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
-    log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads} block_attn_res:{args.block_attn_res}")
+    log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads} block_attn_res:{args.block_attn_res} denseformer:{args.denseformer}")
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
