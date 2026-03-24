@@ -85,6 +85,9 @@ class Hyperparameters:
     ln_scale = bool(int(os.environ.get("LN_SCALE", "1")))
     dtg_enabled = bool(int(os.environ.get("DTG_ENABLED", "0")))
     late_qat_threshold = float(os.environ.get("LATE_QAT_THRESHOLD", 0.15))
+    # Sliding-window inspection: windows with avg bits/token above threshold are saved to a JSONL file.
+    inspect_loss_threshold = float(os.environ.get("INSPECT_LOSS_THRESHOLD", "inf"))
+    inspect_path = os.environ.get("INSPECT_PATH", "")
     ve_enabled = bool(int(os.environ.get("VE_ENABLED", "1")))
     ve_dim = int(os.environ.get("VE_DIM", 128))
     ve_layers = os.environ.get("VE_LAYERS", "9,10")
@@ -906,6 +909,13 @@ class GPT(nn.Module):
         else:
             logits_proj = self.lm_head(x)
         return self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
+_HIST_BINS = [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, float("inf")]
+_HIST_LABELS = ["<1", "1-2", "2-3", "3-4", "4-5", "5-6", "≥6"]
+def _hist_bin(bpt: float) -> int:
+    for j, edge in enumerate(_HIST_BINS[1:]):
+        if bpt < edge:
+            return j
+    return len(_HIST_LABELS) - 1
 def eval_val_sliding(
     args: Hyperparameters,
     base_model: nn.Module,
@@ -919,8 +929,17 @@ def eval_val_sliding(
     stride: int,
     batch_seqs: int = 32,
     eval_seq_len: int | None = None,
-) -> tuple[float, float]:
-    """Sliding window evaluation: each token scored with maximum context."""
+    sp=None,
+    inspect_threshold: float = float("inf"),
+    inspect_path: str = "",
+) -> tuple[float, float, dict]:
+    """Sliding window evaluation: each token scored with maximum context.
+
+    Returns (val_loss, val_bpb, histogram) where histogram maps bpt-range labels
+    to window counts. When inspect_threshold is finite and inspect_path is set,
+    windows exceeding the threshold are written as JSONL to inspect_path (rank 0 only).
+    """
+    import json
     seq_len = eval_seq_len or args.train_seq_len
     total_tokens = val_tokens.numel() - 1
     window_starts = [ws for ws in range(0, total_tokens, stride)
@@ -932,6 +951,9 @@ def eval_val_sliding(
     loss_sum = torch.zeros((), device=device, dtype=torch.float64)
     token_count = torch.zeros((), device=device, dtype=torch.float64)
     byte_count = torch.zeros((), device=device, dtype=torch.float64)
+    hist_counts = [0] * len(_HIST_LABELS)
+    inspect_records: list[dict] = []
+    do_inspect = math.isfinite(inspect_threshold) and inspect_path and rank == 0
     base_model.eval()
     compiled_logits = torch.compile(base_model.forward_logits, dynamic=False, fullgraph=True)
     with torch.inference_mode():
@@ -960,21 +982,71 @@ def eval_val_sliding(
                 s = 0 if ws == 0 else max(wlen - stride, 0)
                 scored_nll = nll[i, s:wlen].to(torch.float64)
                 loss_sum += scored_nll.sum()
-                token_count += float(wlen - s)
+                n_scored = wlen - s
+                token_count += float(n_scored)
                 tgt = y_batch[i, s:wlen]
                 prev = x_batch[i, s:wlen]
                 tb = base_bytes_lut[tgt].to(torch.float64)
                 tb += (has_leading_space_lut[tgt] & ~is_boundary_token_lut[prev]).to(torch.float64)
                 byte_count += tb.sum()
+                # Histogram
+                avg_bpt = float(scored_nll.mean().item()) / math.log(2.0)
+                hist_counts[_hist_bin(avg_bpt)] += 1
+                # High-loss window inspection (rank 0 only)
+                if do_inspect and avg_bpt >= inspect_threshold:
+                    ctx_ids = x_batch[i, :wlen].cpu().tolist()
+                    tgt_ids = y_batch[i, s:wlen].cpu().tolist()
+                    tok_nlls = scored_nll.cpu().tolist()
+                    tok_logits = logits[i, s:wlen].float().cpu()
+                    tok_probs = torch.softmax(tok_logits, dim=-1)
+                    top5_vals, top5_ids = tok_probs.topk(5, dim=-1)
+                    per_token = []
+                    for t_pos in range(n_scored):
+                        tid = tgt_ids[t_pos]
+                        tok_str = sp.id_to_piece(tid) if sp is not None else str(tid)
+                        per_token.append({
+                            "pos": s + t_pos,
+                            "token_id": tid,
+                            "token": tok_str,
+                            "bpt": tok_nlls[t_pos] / math.log(2.0),
+                            "top5": [
+                                {
+                                    "id": int(top5_ids[t_pos, k]),
+                                    "token": sp.id_to_piece(int(top5_ids[t_pos, k])) if sp is not None else str(int(top5_ids[t_pos, k])),
+                                    "prob": round(float(top5_vals[t_pos, k]), 4),
+                                }
+                                for k in range(5)
+                            ],
+                        })
+                    ctx_text = sp.decode(ctx_ids) if sp is not None else ""
+                    scored_text = sp.decode(tgt_ids) if sp is not None else ""
+                    inspect_records.append({
+                        "window_start": ws,
+                        "context_len": wlen,
+                        "scored_start": s,
+                        "n_scored": n_scored,
+                        "avg_bpt": round(avg_bpt, 4),
+                        "context_text": ctx_text,
+                        "scored_text": scored_text,
+                        "per_token": per_token,
+                    })
     if dist.is_available() and dist.is_initialized():
         dist.all_reduce(loss_sum, op=dist.ReduceOp.SUM)
         dist.all_reduce(token_count, op=dist.ReduceOp.SUM)
         dist.all_reduce(byte_count, op=dist.ReduceOp.SUM)
+        hist_tensor = torch.tensor(hist_counts, dtype=torch.int64, device=device)
+        dist.all_reduce(hist_tensor, op=dist.ReduceOp.SUM)
+        hist_counts = hist_tensor.cpu().tolist()
     val_loss = (loss_sum / token_count).item()
     bits_per_token = val_loss / math.log(2.0)
     tokens_per_byte = token_count.item() / byte_count.item()
+    histogram = {label: int(hist_counts[j]) for j, label in enumerate(_HIST_LABELS)}
+    if inspect_records and inspect_path and rank == 0:
+        with open(inspect_path, "a", encoding="utf-8") as f:
+            for rec in inspect_records:
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
     base_model.train()
-    return val_loss, bits_per_token * tokens_per_byte
+    return val_loss, bits_per_token * tokens_per_byte, histogram
 def _classify_param(name: str) -> str:
     if "tok_emb" in name or "lm_head" in name:
         return "embed"
@@ -1474,11 +1546,15 @@ def main() -> None:
     if args.eval_stride > 0 and args.eval_stride < sw_seq_len:
         torch.cuda.synchronize()
         t_slide = time.perf_counter()
-        sw_val_loss, sw_val_bpb = eval_val_sliding(
+        inspect_path_sw = args.inspect_path or ""
+        sw_val_loss, sw_val_bpb, sw_hist = eval_val_sliding(
             args, eval_model, rank, world_size, device,
             val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
             stride=args.eval_stride,
             eval_seq_len=sw_seq_len,
+            sp=sp,
+            inspect_threshold=args.inspect_loss_threshold,
+            inspect_path=inspect_path_sw,
         )
         torch.cuda.synchronize()
         log0(
@@ -1487,14 +1563,17 @@ def main() -> None:
         )
         log0(f"final_int6_sliding_window_exact val_loss:{sw_val_loss:.8f} val_bpb:{sw_val_bpb:.8f}")
         log0(f"final_int8_zlib_roundtrip_exact val_loss:{sw_val_loss:.8f} val_bpb:{sw_val_bpb:.8f}")
+        hist_str = " ".join(f"{k}:{v}" for k, v in sw_hist.items())
+        log0(f"sliding_window_bpt_histogram stride:{args.eval_stride} {hist_str}")
     if args.eval_stride != 64 and 64 < sw_seq_len:
         torch.cuda.synchronize()
         t_slide64 = time.perf_counter()
-        sw64_val_loss, sw64_val_bpb = eval_val_sliding(
+        sw64_val_loss, sw64_val_bpb, sw64_hist = eval_val_sliding(
             args, eval_model, rank, world_size, device,
             val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
             stride=64,
             eval_seq_len=sw_seq_len,
+            sp=sp,
         )
         torch.cuda.synchronize()
         log0(
@@ -1503,6 +1582,8 @@ def main() -> None:
         )
         log0(f"final_int6_sliding_window_s64_exact val_loss:{sw64_val_loss:.8f} val_bpb:{sw64_val_bpb:.8f}")
         log0(f"final_int8_zlib_roundtrip_exact val_loss:{sw64_val_loss:.8f} val_bpb:{sw64_val_bpb:.8f}")
+        hist64_str = " ".join(f"{k}:{v}" for k, v in sw64_hist.items())
+        log0(f"sliding_window_bpt_histogram stride:64 {hist64_str}")
     if distributed:
         dist.destroy_process_group()
 if __name__ == "__main__":
