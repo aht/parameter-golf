@@ -28,6 +28,12 @@ try:
     _FLASH_ATTN_3 = True
 except ImportError:
     _FLASH_ATTN_3 = False
+try:
+    import triton
+    import triton.language as tl
+    _TRITON_AVAILABLE = True
+except ImportError:
+    _TRITON_AVAILABLE = False
 class Hyperparameters:
     data_path = os.environ.get("DATA_PATH", "./data/datasets/fineweb10B_sp1024")
     train_files = os.path.join(data_path, "fineweb_train_*.bin")
@@ -443,19 +449,106 @@ def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
         for name, param in module.named_parameters():
             if (param.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)) and param.dtype != torch.float32:
                 param.data = param.data.float()
+if _TRITON_AVAILABLE:
+    @triton.jit
+    def _attn_res_fwd_kernel(
+        hist_ptr, curr_ptr, w_ptr, out_ptr,
+        B, T,
+        N: tl.constexpr,
+        D: tl.constexpr,
+        stride_hn, stride_hb, stride_ht,
+        stride_cb, stride_ct,
+        stride_ob, stride_ot,
+        EPS: tl.constexpr,
+    ):
+        """
+        Online-softmax AttnRes forward. One Triton program per (b,t) token.
+        Iterates over N history entries + 1 current, computing rms_norm + dot +
+        online-softmax + weighted-sum in a single pass without any (N+1,B,T,D)
+        intermediate tensor.
+        """
+        pid = tl.program_id(0)
+        b = pid // T
+        t = pid % T
+        d = tl.arange(0, D)
+        w = tl.load(w_ptr + d).to(tl.float32)
+        m = -1e30
+        l = 0.0
+        acc = tl.zeros([D], dtype=tl.float32)
+        for n in tl.static_range(N):
+            ptr = hist_ptr + n * stride_hn + b * stride_hb + t * stride_ht
+            v = tl.load(ptr + d).to(tl.float32)
+            rms = tl.sqrt(tl.sum(v * v, axis=0) / D + EPS)
+            logit = tl.sum(w * (v / rms), axis=0)
+            m_new = tl.maximum(m, logit)
+            scale = tl.exp(m - m_new)
+            e = tl.exp(logit - m_new)
+            acc = acc * scale + e * v
+            l = l * scale + e
+            m = m_new
+        ptr = curr_ptr + b * stride_cb + t * stride_ct
+        v = tl.load(ptr + d).to(tl.float32)
+        rms = tl.sqrt(tl.sum(v * v, axis=0) / D + EPS)
+        logit = tl.sum(w * (v / rms), axis=0)
+        m_new = tl.maximum(m, logit)
+        scale = tl.exp(m - m_new)
+        e = tl.exp(logit - m_new)
+        acc = acc * scale + e * v
+        l = l * scale + e
+        tl.store(out_ptr + b * stride_ob + t * stride_ot + d, (acc / l).to(tl.bfloat16))
+    class _AttnResFunc(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, history: Tensor, current: Tensor, w: Tensor) -> Tensor:
+            N, B, T, D = history.shape
+            out = torch.empty(B, T, D, dtype=current.dtype, device=current.device)
+            num_warps = max(1, D // 32)
+            _attn_res_fwd_kernel[(B * T,)](
+                history, current, w, out,
+                B, T,
+                N=N, D=D,
+                stride_hn=int(history.stride(0)), stride_hb=int(history.stride(1)), stride_ht=int(history.stride(2)),
+                stride_cb=int(current.stride(0)), stride_ct=int(current.stride(1)),
+                stride_ob=int(out.stride(0)),     stride_ot=int(out.stride(1)),
+                EPS=1e-6,
+                num_warps=num_warps,
+            )
+            ctx.save_for_backward(history, current, w)
+            return out
+        @staticmethod
+        def backward(ctx, grad_out: Tensor) -> tuple[Tensor | None, Tensor, Tensor]:
+            history, current, w = ctx.saved_tensors
+            V = torch.cat([history, current.unsqueeze(0)], dim=0)  # (N+1, B, T, D)
+            K = F.rms_norm(V, (V.size(-1),))
+            w_cast = w.to(V.dtype)
+            logits = torch.einsum("d,nbtd->nbt", w_cast, K)
+            z = logits.softmax(dim=0)
+            # Gradient through the weighted-sum output path
+            grad_z = torch.einsum("btd,nbtd->nbt", grad_out, V)
+            # Softmax Jacobian: grad_logit = z * (grad_z - sum_n(z_n * grad_z_n))
+            grad_logit = z * (grad_z - (z * grad_z).sum(0, keepdim=True))
+            # Gradient w.r.t. w (via logit = dot(w, K))
+            grad_w = torch.einsum("nbt,nbtd->d", grad_logit, K.float())
+            # Gradient through rms_norm: grad_V = inv_rms*(grad_K - K*mean(grad_K*K, dim=-1))
+            grad_K = grad_logit.unsqueeze(-1) * w_cast
+            K_f = K.float()
+            inv_rms = torch.rsqrt(V.float().pow(2).mean(-1, keepdim=True) + 1e-6)
+            grad_V_norm = inv_rms * (grad_K.float() - K_f * (grad_K.float() * K_f).mean(-1, keepdim=True))
+            # Gradient through the value path
+            grad_V_val = z.unsqueeze(-1) * grad_out.unsqueeze(0)
+            grad_V = (grad_V_norm + grad_V_val).to(history.dtype)
+            return grad_V[:-1], grad_V[-1], grad_w.to(w.dtype)
+    @torch.compiler.allow_in_graph
+    def _attn_res_triton(history: Tensor, current: Tensor, w: Tensor) -> Tensor:
+        return _AttnResFunc.apply(history, current, w)
 def _attn_res_op(history: Tensor, current: Tensor, w: Tensor) -> Tensor:
-    # history: (N, B, T, D) — x0 at index 0, prior block outputs after.
-    # current: (B, T, D); w: (D,) fp32.
-    #
-    #   V = cat([history, current])      # (N+1, B, T, D)
-    #   K = RMSNorm(V)                   # normalize across D
-    #   logits[n,b,t] = w · K[n,b,t]    # scalar dot-product per entry
-    #   out[b,t] = softmax(logits) · V  # weighted sum over history
-    #
-    # Zero-init w → uniform attention at start (neutral average).
-    # The caller applies a gated residual: x + gate*(out - x) with gate=0 init,
-    # so the full operation starts as identity regardless of w.
-    V = torch.cat([history, current.unsqueeze(0)], dim=0)   # (N+1, B, T, D)
+    # history: (N, B, T, D); current: (B, T, D); w: (D,) fp32.
+    # V = cat([history, current]), K = RMSNorm(V), out = softmax(w·K) · V
+    # w=0 init → uniform average at start. Online-softmax Triton kernel fuses
+    # rms_norm + dot + softmax + weighted-sum, avoiding the (N+1,B,T,D) intermediates.
+    D = history.size(-1)
+    if _TRITON_AVAILABLE and history.is_cuda and (D & (D - 1)) == 0:
+        return _attn_res_triton(history, current, w)
+    V = torch.cat([history, current.unsqueeze(0)], dim=0)
     K = F.rms_norm(V, (V.size(-1),))
     logits = torch.einsum("d,nbtd->nbt", w.to(V.dtype), K)
     return torch.einsum("nbt,nbtd->btd", logits.softmax(dim=0), V)
@@ -1299,7 +1392,7 @@ def main() -> None:
         optimizers.insert(1, optimizer_head)
     n_params = sum(p.numel() for p in base_model.parameters())
     mtp_params = sum(p.numel() for p in base_model.mtp_heads.parameters())
-    log0(f"_FLASH_ATTN_3:{_FLASH_ATTN_3}")
+    log0(f"_FLASH_ATTN_3:{_FLASH_ATTN_3} _TRITON_AVAILABLE:{_TRITON_AVAILABLE}")
     log0(f"model_params:{n_params}")
     log0(f"mtp_num_heads:{args.mtp_num_heads} mtp_loss_weight:{args.mtp_loss_weight} mtp_params:{mtp_params}")
     xsa_layers = [i for i, b in enumerate(base_model.blocks) if b.attn.use_xsa]
