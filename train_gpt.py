@@ -496,50 +496,48 @@ if _TRITON_AVAILABLE:
         acc = acc * scale + e * v
         l = l * scale + e
         tl.store(out_ptr + b * stride_ob + t * stride_ot + d, (acc / l).to(tl.bfloat16))
-    class _AttnResFunc(torch.autograd.Function):
-        @staticmethod
-        def forward(ctx, history: Tensor, current: Tensor, w: Tensor) -> Tensor:
-            N, B, T, D = history.shape
-            out = torch.empty(B, T, D, dtype=current.dtype, device=current.device)
-            num_warps = max(1, D // 32)
-            _attn_res_fwd_kernel[(B * T,)](
-                history, current, w, out,
-                B, T,
-                N=N, D=D,
-                stride_hn=int(history.stride(0)), stride_hb=int(history.stride(1)), stride_ht=int(history.stride(2)),
-                stride_cb=int(current.stride(0)), stride_ct=int(current.stride(1)),
-                stride_ob=int(out.stride(0)),     stride_ot=int(out.stride(1)),
-                EPS=1e-6,
-                num_warps=num_warps,
-            )
-            ctx.save_for_backward(history, current, w)
-            return out
-        @staticmethod
-        def backward(ctx, grad_out: Tensor) -> tuple[Tensor | None, Tensor, Tensor]:
-            history, current, w = ctx.saved_tensors
-            V = torch.cat([history, current.unsqueeze(0)], dim=0)  # (N+1, B, T, D)
-            K = F.rms_norm(V, (V.size(-1),))
-            w_cast = w.to(V.dtype)
-            logits = torch.einsum("d,nbtd->nbt", w_cast, K)
-            z = logits.softmax(dim=0)
-            # Gradient through the weighted-sum output path
-            grad_z = torch.einsum("btd,nbtd->nbt", grad_out, V)
-            # Softmax Jacobian: grad_logit = z * (grad_z - sum_n(z_n * grad_z_n))
-            grad_logit = z * (grad_z - (z * grad_z).sum(0, keepdim=True))
-            # Gradient w.r.t. w (via logit = dot(w, K))
-            grad_w = torch.einsum("nbt,nbtd->d", grad_logit, K.float())
-            # Gradient through rms_norm: grad_V = inv_rms*(grad_K - K*mean(grad_K*K, dim=-1))
-            grad_K = grad_logit.unsqueeze(-1) * w_cast
-            K_f = K.float()
-            inv_rms = torch.rsqrt(V.float().pow(2).mean(-1, keepdim=True) + 1e-6)
-            grad_V_norm = inv_rms * (grad_K.float() - K_f * (grad_K.float() * K_f).mean(-1, keepdim=True))
-            # Gradient through the value path
-            grad_V_val = z.unsqueeze(-1) * grad_out.unsqueeze(0)
-            grad_V = (grad_V_norm + grad_V_val).to(history.dtype)
-            return grad_V[:-1], grad_V[-1], grad_w.to(w.dtype)
-    @torch.compiler.allow_in_graph
-    def _attn_res_triton(history: Tensor, current: Tensor, w: Tensor) -> Tensor:
-        return _AttnResFunc.apply(history, current, w)
+    def _attn_res_triton_run(history: Tensor, current: Tensor, w: Tensor) -> Tensor:
+        N, B, T, D = history.shape
+        out = torch.empty(B, T, D, dtype=current.dtype, device=current.device)
+        _attn_res_fwd_kernel[(B * T,)](
+            history, current, w, out, B, T, N=N, D=D,
+            stride_hn=int(history.stride(0)), stride_hb=int(history.stride(1)), stride_ht=int(history.stride(2)),
+            stride_cb=int(current.stride(0)), stride_ct=int(current.stride(1)),
+            stride_ob=int(out.stride(0)),     stride_ot=int(out.stride(1)),
+            EPS=1e-6, num_warps=max(1, D // 32),
+        )
+        return out
+    # Register as a torch.library custom op so torch.compile can trace through it:
+    # register_fake provides shape/dtype without running the kernel (FakeTensor-safe),
+    # register_autograd provides the backward with recomputed intermediates.
+    @torch.library.custom_op("parameter_golf::attn_res", mutates_args=())
+    def _attn_res_custom_op(history: Tensor, current: Tensor, w: Tensor) -> Tensor:
+        return _attn_res_triton_run(history, current, w)
+    @_attn_res_custom_op.register_fake
+    def _(history: Tensor, current: Tensor, w: Tensor) -> Tensor:
+        _, B, T, D = history.shape
+        return current.new_empty(B, T, D)
+    def _attn_res_setup_ctx(ctx, inputs, output):
+        history, current, w = inputs
+        ctx.save_for_backward(history, current, w)
+    def _attn_res_bwd(ctx, grad_out: Tensor):
+        history, current, w = ctx.saved_tensors
+        V = torch.cat([history, current.unsqueeze(0)], dim=0)
+        K = F.rms_norm(V, (V.size(-1),))
+        w_cast = w.to(V.dtype)
+        logits = torch.einsum("d,nbtd->nbt", w_cast, K)
+        z = logits.softmax(dim=0)
+        grad_z = torch.einsum("btd,nbtd->nbt", grad_out, V)
+        grad_logit = z * (grad_z - (z * grad_z).sum(0, keepdim=True))
+        grad_w = torch.einsum("nbt,nbtd->d", grad_logit, K.float())
+        grad_K = grad_logit.unsqueeze(-1) * w_cast
+        K_f = K.float()
+        inv_rms = torch.rsqrt(V.float().pow(2).mean(-1, keepdim=True) + 1e-6)
+        grad_V_norm = inv_rms * (grad_K.float() - K_f * (grad_K.float() * K_f).mean(-1, keepdim=True))
+        grad_V_val = z.unsqueeze(-1) * grad_out.unsqueeze(0)
+        grad_V = (grad_V_norm + grad_V_val).to(history.dtype)
+        return grad_V[:-1], grad_V[-1], grad_w.to(w.dtype)
+    _attn_res_custom_op.register_autograd(_attn_res_bwd, setup_context=_attn_res_setup_ctx)
 def _attn_res_op(history: Tensor, current: Tensor, w: Tensor) -> Tensor:
     # history: (N, B, T, D); current: (B, T, D); w: (D,) fp32.
     # V = cat([history, current]), K = RMSNorm(V), out = softmax(w·K) · V
@@ -547,7 +545,7 @@ def _attn_res_op(history: Tensor, current: Tensor, w: Tensor) -> Tensor:
     # rms_norm + dot + softmax + weighted-sum, avoiding the (N+1,B,T,D) intermediates.
     D = history.size(-1)
     if _TRITON_AVAILABLE and history.is_cuda and (D & (D - 1)) == 0:
-        return _attn_res_triton(history, current, w)
+        return _attn_res_custom_op(history, current, w)
     V = torch.cat([history, current.unsqueeze(0)], dim=0)
     K = F.rms_norm(V, (V.size(-1),))
     logits = torch.einsum("d,nbtd->nbt", w.to(V.dtype), K)
