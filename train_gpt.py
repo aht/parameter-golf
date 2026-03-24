@@ -246,7 +246,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,attn_res_gate,q_gain,skip_weight,skip_weights,smear,dtg_gate,ve_layer_scales,ve_shared.scale",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,q_gain,skip_weight,skip_weights,smear,dtg_gate,ve_layer_scales,ve_shared.scale",
     ).split(",")
     if pattern
 )
@@ -630,13 +630,10 @@ class Block(nn.Module):
         if block_attn_res:
             # Block variant: one AttnRes op at block entry; MLP uses plain residual.
             self.attn_res_w = nn.Parameter(torch.zeros(dim, dtype=torch.float32))
-            self.attn_res_gate = nn.Parameter(torch.zeros(1, dtype=torch.float32))
         else:
             # Full variant (default): AttnRes before attention AND before MLP.
             self.attn_res_w_attn = nn.Parameter(torch.zeros(dim, dtype=torch.float32))
             self.attn_res_w_mlp  = nn.Parameter(torch.zeros(dim, dtype=torch.float32))
-            self.attn_res_gate_attn = nn.Parameter(torch.zeros(1, dtype=torch.float32))
-            self.attn_res_gate_mlp  = nn.Parameter(torch.zeros(1, dtype=torch.float32))
         if dtg:
             self.dtg_gate = nn.Linear(dim, 1, bias=True)
             nn.init.zeros_(self.dtg_gate.weight)
@@ -645,18 +642,15 @@ class Block(nn.Module):
             self.dtg_gate = None
     def forward(self, x: Tensor, history: Tensor, v_embed: Tensor | None = None) -> Tensor:
         # history: (N, B, T, D) — x0 at [0], prior block outputs after; managed by GPT.forward.
-        # Gated residual (gate init=0 → identity at start): x + gate*(attn_res_out - x).
+        # w=0 init → uniform attention over history (neutral average) at start.
         if self.block_attn_res:
-            ar = _attn_res_op(history, x, self.attn_res_w)
-            x_in = x + self.attn_res_gate.to(x.dtype) * (ar - x)
+            x_in = _attn_res_op(history, x, self.attn_res_w)
         else:
-            ar = _attn_res_op(history, x, self.attn_res_w_attn)
-            x_in = x + self.attn_res_gate_attn.to(x.dtype) * (ar - x)
+            x_in = _attn_res_op(history, x, self.attn_res_w_attn)
         attn_out = self.attn(self.attn_norm(x_in) * self.ln_scale_factor, v_embed=v_embed)
         x_out = x_in + self.attn_scale.to(dtype=x_in.dtype)[None, None, :] * attn_out
         if not self.block_attn_res:
-            ar2 = _attn_res_op(history, x_out, self.attn_res_w_mlp)
-            x_out = x_out + self.attn_res_gate_mlp.to(x.dtype) * (ar2 - x_out)
+            x_out = _attn_res_op(history, x_out, self.attn_res_w_mlp)
         x_out = x_out + self.mlp_scale.to(dtype=x_out.dtype)[None, None, :] * self.mlp(self.mlp_norm(x_out) * self.ln_scale_factor)
         if self.dtg_gate is not None:
             gate = torch.sigmoid(self.dtg_gate(x_in.detach()))
